@@ -1,0 +1,512 @@
+---
+title: "Step 4: Movement Patterns"
+author: "Romuald Rambikarison"
+output: html_document
+date: "2025-11-13"
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(
+  fig.path = "outputs/fig_step4-",  
+  dev      = "png",                 
+  dpi      = 300,                   
+  fig.width = 7,
+  fig.height = 4,
+  echo = TRUE)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(geosphere)  
+library(dplyr)
+library(RColorBrewer)
+
+```
+
+
+
+### Main questions answered in this step:
+
+### How do we turn points into "movement events" (stay vs move)?
+
+### How long do people dwell in clusters? (dwell time behavior)
+
+### How far / how often do they move between clusters?
+
+### When during the day do movements happen most? What's the typical weekly movement?
+
+### Which transitions between clusters are most common?
+
+### Summaries for the report.
+
+```{r}
+############################
+# STEP 4 – Movement Patterns
+############################
+
+locs <- readRDS("../data_versions/v03_all_locations_clustered_2025-12-04.rds")
+setDT(locs)
+
+str(locs)
+
+locs[, datetime := as.POSIXct(datetime, tz = "UTC")]
+locs[, month    := as.Date(month)]
+
+
+setorder(locs, client_id, datetime)
+
+
+##  Q4.1 – Stay vs move
+
+
+locs[, `:=`(
+  prev_client  = shift(client_id, type = "lag"),
+  prev_time    = shift(datetime, type = "lag"),
+  prev_cluster = shift(cluster,   type = "lag"),
+  prev_lat     = shift(latitude,  type = "lag"),
+  prev_lon     = shift(longitude, type = "lag")
+), by = client_id]
+
+# Time gap in minutes between points
+locs[, gap_minutes := as.numeric(difftime(datetime, prev_time, units = "mins"))]
+
+# Treat gaps > 60 min as breaks 
+locs[, same_sequence := !is.na(prev_time) & gap_minutes <= 60]
+
+# “move” = cluster changed; otherwise “stay”
+locs[, moved := same_sequence & (cluster != prev_cluster)]
+
+# Table: how many stays vs moves
+stay_move_summary <- locs[same_sequence == TRUE,
+                          .(n_points = .N),
+                          by = moved][order(-moved)]
+
+print(stay_move_summary)
+
+
+##  Build a movement-events table 
+
+# Keep only actual moves within 60-minute gaps
+moves <- locs[moved == TRUE & same_sequence == TRUE,
+              .(
+                client_id,
+                month,
+                from_cluster = prev_cluster,
+                to_cluster   = cluster,
+                depart_time  = prev_time,
+                arrive_time  = datetime,
+                gap_minutes,
+                from_lat     = prev_lat,
+                from_lon     = prev_lon,
+                to_lat       = latitude,
+                to_lon       = longitude
+              )]
+
+# Save for Step 5
+saveRDS(moves, "../data_versions/v04_moves_2025-12-04.rds")
+
+
+##  Q4.2 – How long do people dwell in clusters? 
+
+# Dwell time = time spent between leaving one cluster and arriving at next
+
+dwell_summary <- moves[
+  ,
+  .(
+    n_moves      = .N,
+    mean_dwell   = mean(gap_minutes, na.rm = TRUE),
+    median_dwell = median(gap_minutes, na.rm = TRUE),
+    p25_dwell    = quantile(gap_minutes, 0.25, na.rm = TRUE),
+    p75_dwell    = quantile(gap_minutes, 0.75, na.rm = TRUE)
+  ),
+  by = from_cluster
+][order(from_cluster)]
+
+print(dwell_summary)
+
+
+##  Q4.3 – How far / how often do they move between clusters? 
+
+# Distance (meters) between successive points using lat/lon
+moves[, dist_m := distHaversine(
+  cbind(from_lon, from_lat),
+  cbind(to_lon,   to_lat)
+)]
+
+# Overall distance summary
+distance_summary <- moves[
+  ,
+  .(
+    n_moves        = .N,
+    mean_dist_m    = mean(dist_m, na.rm = TRUE),
+    median_dist_m  = median(dist_m, na.rm = TRUE),
+    p75_dist_m     = quantile(dist_m, 0.75, na.rm = TRUE),
+    max_dist_m     = max(dist_m, na.rm = TRUE)
+  )
+]
+
+print(distance_summary)
+
+# 4.4 Movement summary
+move_summary_overall <- distance_summary
+
+# Histogram of movement distances (truncated at 50 km)
+library(scales)
+
+moves[, dist_km := dist_m / 1000]
+
+ggplot(moves[dist_km <= 50],
+       aes(x = dist_km, fill = ..count..)) +
+  geom_histogram(bins = 50) +
+  scale_fill_distiller(palette = "Spectral", direction = 1,
+                       labels = comma) +    
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Movement Distances",
+    x = "Move distance (km)",
+    y = "Number of movements",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+```
+
+```{r}
+
+## Q4.4 – When during the day do movements happen most? 
+
+# 1. Get hour-of-day from the movement time
+moves[, hour_of_day := hour(depart_time)]
+
+# 2. Count movements by hour, drop NA
+moves_by_hour <- moves[!is.na(hour_of_day),
+                       .(n_moves = .N),
+                       by = hour_of_day][order(hour_of_day)]
+
+# 3. Ensure all 24 hours appear (0–23)
+all_hours <- data.table(hour_of_day = 0:23)
+moves_by_hour <- merge(all_hours, moves_by_hour,
+                       by = "hour_of_day",
+                       all.x = TRUE)
+
+moves_by_hour[is.na(n_moves), n_moves := 0]
+setorder(moves_by_hour, hour_of_day)
+
+print(moves_by_hour)
+
+# 4. Plot – simple bars 
+colors24 <- colorRampPalette(RColorBrewer::brewer.pal(8, "Set3"))(24)
+
+ggplot(moves_by_hour,
+       aes(x = hour_of_day,
+           y = n_moves,
+           fill = factor(hour_of_day))) +
+  geom_col(show.legend = FALSE) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_fill_manual(values = colors24) +
+  labs(
+    title = "Movements by hour of day",
+    x     = "Hour of day (0–23)",
+    y     = "Number of movements",
+    fill  = "Hour"
+  )
+
+
+
+```
+
+**Interpretation**: People most frequently move between clusters 0 and 1, making these the dominant pathways in the dataset. This strong back-and-forth pattern suggests that clusters 0 and 1 likely represent the two most important places in users’ daily routines—such as home and work, or two major activity hubs in the area. Overall, the transition pattern is heavily concentrated around these two clusters, with all other transitions occurring far less often.
+
+```{r}
+############################
+# 4.6 Typical week movement patterns
+############################
+
+
+## 4.6.1 Movements by weekday 
+
+# Use depart_time as the time of movement
+moves[, weekday := wday(depart_time,
+                        label     = TRUE,
+                        abbr      = TRUE,
+                        week_start = 1)]
+
+# Count movements per weekday
+moves_by_weekday <- moves[!is.na(weekday),
+                          .(n_moves = .N),
+                          by = weekday][order(weekday)]
+
+# Total movements 
+moves_by_weekday[, prop_of_total := n_moves / sum(n_moves)]
+
+print(moves_by_weekday)
+
+# Bar plot by weekday
+pal_weekdays <- RColorBrewer::brewer.pal(7, "Set3")
+
+ggplot(moves_by_weekday,
+       aes(x = weekday,
+           y = n_moves,
+           fill = weekday)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = pal_weekdays) +
+  labs(
+    title = "Movements by weekday",
+    x     = "Weekday",
+    y     = "Number of movements"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+## 4.6.2 Hour-of-day by weekday 
+
+moves[, hour_of_day := hour(depart_time)]
+
+moves_by_weekday_hour <- moves[
+  !is.na(weekday) & !is.na(hour_of_day),
+  .(n_moves = .N),
+  by = .(weekday, hour_of_day)
+]
+
+all_weekdays <- levels(moves_by_weekday_hour$weekday)
+full_grid <- as.data.table(expand.grid(
+  weekday    = all_weekdays,
+  hour_of_day = 0:23,
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+))
+
+full_grid[, weekday := factor(weekday, levels = all_weekdays)]
+
+moves_by_weekday_hour <- merge(
+  full_grid,
+  moves_by_weekday_hour,
+  by = c("weekday", "hour_of_day"),
+  all.x = TRUE
+)
+
+moves_by_weekday_hour[is.na(n_moves), n_moves := 0]
+
+print(head(moves_by_weekday_hour))
+
+# Heatmap: typical week movement intensity
+ggplot(moves_by_weekday_hour,
+       aes(x = weekday,
+           y = hour_of_day,
+           fill = n_moves)) +
+  geom_tile() +
+  scale_y_continuous(
+    breaks = 0:23,
+    expand = c(0, 0)
+  ) +
+  scale_fill_distiller(
+    palette = "Spectral",
+    direction = -1,
+    labels = comma
+  ) +
+  labs(
+    title = "Movement intensity over a typical week",
+    x     = "Weekday",
+    y     = "Hour of day (0–23)",
+    fill  = "Number of movements"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 10)
+  )
+
+```
+
+**Interpretation**
+
+```{r}
+############################
+#  Normalized typical-week heatmap
+############################
+
+#  Movement count per user × weekday × hour
+user_wk_hour <- moves[
+  ,
+  .(n_moves = .N),
+  by = .(client_id, weekday, hour_of_day)
+]
+
+# Normalize within each user
+user_wk_hour[, total_user := sum(n_moves), by = client_id]
+user_wk_hour[, weight := n_moves / total_user]
+
+# Aggregate normalized weights across users
+normalized_heat <- user_wk_hour[
+  ,
+  .(avg_weight = mean(weight, na.rm = TRUE)),
+  by = .(weekday, hour_of_day)
+]
+
+# Plot
+ggplot(normalized_heat,
+       aes(x = weekday, y = hour_of_day, fill = avg_weight)) +
+  geom_tile() +
+  scale_fill_distiller(
+    palette = "Spectral",
+    direction = -1,
+    labels = percent
+  ) +
+  scale_y_continuous(breaks = 0:23) +
+  labs(
+    title = "Normalized movement intensity (each user weighted equally)",
+    x = "Weekday",
+    y = "Hour of day",
+    fill = "Relative\nintensity"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+**Interpretation**
+
+```{r}
+############################
+#  Build transition_counts & transition_matrix
+############################
+
+
+# 1. Sort by person and time
+setorder(locs, client_id, datetime)
+
+# 2. Previous cluster for each person
+locs[, prev_cluster := shift(cluster), by = client_id]
+
+# 3. True movements between different clusters
+transitions <- locs[
+  !is.na(prev_cluster) & !is.na(cluster) & cluster != prev_cluster,
+  .(from_cluster = prev_cluster,
+    to_cluster   = cluster)
+]
+
+# 4. Count transitions
+transition_counts <- transitions[
+  , .(n_moves = .N),
+  by = .(from_cluster, to_cluster)
+]
+
+# 4b. Create a label for plotting (e.g., "0 -> 1")
+transition_counts[, transition := paste0(from_cluster, " -> ", to_cluster)]
+
+# 5. Top transitions (used for Step 5)
+top_transitions <- transition_counts[order(-n_moves)][1:20]
+
+# 6. Plot (horizontal bar chart)
+ggplot(top_transitions, aes(
+  x = n_moves,
+  y = reorder(transition, n_moves),
+  fill = factor(from_cluster)
+)) +
+  geom_col() +
+  labs(
+    title = "Top Cluster-to-Cluster Transitions",
+    x = "Number of movements",
+    y = "Transition (from -> to)",
+    fill = "factor(from_cluster)"
+  ) +
+  theme_minimal(base_size = 14)
+
+# 7. Wide transition matrix
+transition_matrix_wide <- dcast(
+  transition_counts,
+  from_cluster ~ to_cluster,
+  value.var = "n_moves",
+  fill = 0
+)
+
+transition_matrix <- as.matrix(transition_matrix_wide[, -"from_cluster"])
+rownames(transition_matrix) <- transition_matrix_wide$from_cluster
+
+
+
+```
+
+### Key Summaries
+
+```{r}
+
+# List of objects we want in v04 for Step 5
+summary_names <- c(
+  "dwell_user_cluster",
+  "dwell_cluster_summary",
+  "transition_counts",
+  "transition_matrix",
+  "top_transitions",
+  "move_summary_overall",
+  "moves_by_hour",
+  "normalized_heat",
+  "transition_counts",
+"transition_matrix",
+"top_transitions"
+)
+
+summary_names <- summary_names[sapply(summary_names, exists)]
+
+movement_summaries <- lapply(summary_names, get)
+names(movement_summaries) <- summary_names
+
+saveRDS(
+  movement_summaries,
+  file = "../data_versions/v04_movement_summaries_2025-12-04.rds"
+)
+
+
+cat("Saved movement summaries to ../data_versions/v04_movement_summaries_2025-12-04.rds\n")
+
+############################
+# Export all main tables as CSV
+############################
+
+export_names <- c(
+  "steps",
+  "steps_filtered",
+  "dwell_user_cluster",
+  "dwell_cluster_summary",
+  "top10",
+  "moves",
+  "moves_per_user",
+  "moves_by_hour",
+  "user_week_heat",    
+  "normalized_heat",
+  "transition_counts",
+  "top_transitions"
+)
+
+# keep only objects that exist
+export_names <- export_names[sapply(export_names, exists)]
+
+export_list <- lapply(export_names, get)
+names(export_list) <- export_names
+
+# keep only data.frame / data.table objects
+is_tabular <- sapply(export_list, function(x)
+  is.data.frame(x) || data.table::is.data.table(x)
+)
+
+if (any(!is_tabular)) {
+  cat(
+    "Skipping non-tabular objects:",
+    paste(names(export_list)[!is_tabular], collapse = ", "),
+    "\n"
+  )
+}
+
+# export only the tabular ones
+for (nm in names(export_list)[is_tabular]) {
+  fwrite(
+    export_list[[nm]],
+    file = file.path("outputs", paste0("step4_", nm, ".csv"))
+  )
+}
+
+cat("Exported", sum(is_tabular), "tables to /outputs as CSV files.\n")
+
+```
