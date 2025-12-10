@@ -1,0 +1,77 @@
+---
+title: "Updated Clustering"
+author: "Yu Chung Lee"
+date: "2025-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dbscan)
+library(data.table)
+library(lubridate)
+setwd("C:/Users/natan/Documents/CptS 475")
+```
+
+## Cleaning
+
+Quick reference code to how I'm cleaning/prepping my data:
+
+```{r cleaning, eval=FALSE}
+library(tidyverse)
+library(lubridate)
+readRDS("./all_locations.rds") %>%
+  filter(between(accuracy, 0, 50)) %>%
+  mutate(
+    datetime = ymd_hms(datetime),
+    month = floor_date(datetime, 'month')
+  ) %>%
+  arrange(client_id, datetime) %>%
+  saveRDS("./all_locations_cleaned.rds")
+```
+
+## Clustering
+Decided on eps=50 since accuracy is 50m, keeping the epsilon around 50m as well seems reasonable.
+```{r clustering}
+clean_data <- readRDS("./locations/all_locations_cleaned.rds")
+cluster_month <- function(data) {
+  # clustering
+  coords <- as.matrix(data[, c("latitude", "longitude")])
+  model <- dbscan::dbscan(coords, eps = 50/111000, minPts = 10)
+  data <- data %>%
+    mutate(cluster = model$cluster)
+  
+  # removing noise
+  data <- data %>% filter(cluster != 0)
+  
+  # calculating time and ranking
+  data <- data %>%
+    arrange(datetime) %>%
+    mutate(next_time = lead(datetime),
+           next_cluster = lead(cluster),
+           time_diff_mins = as.numeric(difftime(next_time, datetime, units = "mins")),
+           same_cluster = cluster == next_cluster) %>%
+    filter(same_cluster, !is.na(time_diff_mins), cluster != 0, time_diff_mins <= 60) %>%
+    group_by(cluster) %>%
+    summarise(
+      n_points = n(),
+      lat_center = mean(latitude),
+      lon_center = mean(longitude),
+      total_minutes = sum(time_diff_mins)
+    ) %>%
+    arrange(desc(total_minutes)) %>%
+    mutate(rank = row_number()) %>%
+    slice(1:5)
+}
+
+start_time <- Sys.time()
+result <- clean_data %>%
+  group_by(client_id, month) %>%
+  group_modify(~ cluster_month(.x)) %>%
+  ungroup()
+
+head(result)
+end_time <- Sys.time()
+print(end_time - start_time)
+```
