@@ -1,0 +1,349 @@
+---
+title: 'Step 5: Predictive Model: predict next destination cluster'
+author: Romuald Rambikarison
+output: html_document
+date: "2025-12-04"
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(data.table)
+library(lubridate)
+library(ggplot2)
+library(randomForest)
+library(pROC)
+library(nnet)
+```
+
+## MODEL 1: Predictor=cluster_popularity
+
+```{r data} 
+
+movement_summaries <- readRDS("../data_versions/v04_movement_summaries_2025-12-04.rds")
+
+transition_counts     <- as.data.table(movement_summaries$transition_counts)
+
+
+str(transition_counts)
+
+```
+
+
+#  BUILD MODELING DATASET (CLUSTER-LEVEL)
+
+```{r Dataset_Modeling}
+
+
+# 1. cluster popularity = total outgoing moves from each origin cluster
+cluster_popularity <- transition_counts[
+  , .(cluster_popularity = sum(n_moves)),
+  by = from_cluster
+]
+
+transition_counts <- merge(
+  transition_counts,
+  cluster_popularity,
+  by   = "from_cluster",
+  all.x = TRUE
+)
+
+# 2. Convert clusters to factors
+transition_counts[, from_cluster := factor(from_cluster)]
+transition_counts[, to_cluster   := factor(to_cluster)]
+
+# Summary
+summary(transition_counts[, .(
+  n_moves,
+  cluster_popularity
+)])
+
+```
+# REDUCE DESTINATION CLASSES: TOP 50 + "OTHER"
+
+```{r cluster-level dwell}
+# Running the full dataset takes forever so I reduced the destination classes to top 50 only
+
+top_dests <- transition_counts[
+  , .(total_moves = sum(n_moves)), by = to_cluster
+][order(-total_moves)][1:50, to_cluster]
+
+top_dests
+
+transition_counts[
+  ,
+  to_cluster_small := ifelse(
+    to_cluster %in% top_dests,
+    as.character(to_cluster),
+    "Other"
+  )
+]
+
+transition_counts[, to_cluster_small := factor(to_cluster_small)]
+
+table(transition_counts$to_cluster_small)
+
+```
+
+
+
+# TRAIN / TEST SPLIT
+
+```{r train_test}
+set.seed(123)
+
+n <- nrow(transition_counts)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+
+train_dt <- transition_counts[train_idx]
+test_dt  <- transition_counts[-train_idx]
+
+
+
+train_dt[, to_cluster_small := droplevels(to_cluster_small)]
+test_dt[,  to_cluster_small :=
+factor(to_cluster_small,
+levels = levels(train_dt$to_cluster_small))]
+
+
+
+str(train_dt)
+```
+```{r Collapse}
+# Collapse rare origin clusters (from_cluster)
+
+#  Number of transitions that come out of each origin cluster in the TRAIN set
+origin_counts <- train_dt[, .(N = sum(n_moves)), by = from_cluster][order(-N)]
+
+# Top 50 origin clusters
+popular_from <- origin_counts[1:50, from_cluster] ## Error if more than 53
+
+train_dt[
+  ,
+  from_cluster_small := ifelse(
+    from_cluster %in% popular_from,
+    as.character(from_cluster),
+    "Other_from"
+  )
+]
+train_dt[, from_cluster_small := factor(from_cluster_small)]
+
+
+test_dt[
+  ,
+  from_cluster_small := ifelse(
+    from_cluster %in% popular_from,
+    as.character(from_cluster),
+    "Other_from"
+  )
+]
+test_dt[, from_cluster_small :=
+          factor(from_cluster_small,
+                 levels = levels(train_dt$from_cluster_small))]
+
+```
+
+
+# RANDOM FOREST
+
+```{r RF Model 1}
+
+
+rf_formula <- to_cluster_small ~ from_cluster_small + cluster_popularity
+
+rf_mod <- randomForest(
+  rf_formula,
+  data       = train_dt,
+  ntree      = 300,
+  mtry       = 2,
+  importance = TRUE
+)
+
+rf_mod
+varImpPlot(rf_mod)
+
+
+```
+
+# MODEL EVALUATION (WEIGHTED ACCURACY)
+
+
+
+```{r eval}
+wacc <- function(truth, pred, w) {
+sum(w * (truth == pred), na.rm = TRUE) / sum(w, na.rm = TRUE)
+}
+
+
+## Random Forest predictions
+
+rf_pred <- predict(rf_mod, newdata = test_dt)
+rf_cm   <- table(
+truth = test_dt$to_cluster_small,
+pred  = rf_pred
+)
+
+rf_cm
+rf_acc <- wacc(test_dt$to_cluster_small, rf_pred, test_dt$n_moves)
+rf_acc
+```
+
+## MODEL 2: Predictors= from cluster +popularity clusters+ temporal features
+
+```{r model 2 data}
+moves <- readRDS("../data_versions/v04_moves_2025-12-04.rds")
+# Ensure moves is a data.table
+setDT(moves)
+
+# Make sure timestamp is POSIXct (if not already)
+moves[, depart_time := as.POSIXct(depart_time)]
+
+
+```
+
+## Time based predictors to moves
+```{r temporal}
+# Add time features at the movement-event level
+moves[
+  ,
+  `:=`(
+    hour_of_day = hour(depart_time),                              # 0–23
+    wday        = wday(depart_time, label = TRUE, week_start = 1),# Mon–Sun
+    is_weekend  = wday(depart_time) %in% c(1, 7),                 # Sun=1, Sat=7
+    part_of_day = cut(
+      hour(depart_time),
+      breaks = c(-1, 5, 11, 17, 21, 24),
+      labels = c("Night", "Morning", "Midday", "Afternoon", "Evening")
+    )
+  )
+]
+
+moves[
+  ,
+  `:=`(
+    wday       = factor(wday),
+    is_weekend = factor(is_weekend, levels = c(FALSE, TRUE),
+                        labels = c("Weekday", "Weekend")),
+    part_of_day = factor(part_of_day)
+  )
+]
+
+```
+## Cluster popularity and keep only top 50 destination clusters
+```{r pop clust}
+# Cluster popularity based on destination cluster
+cluster_pop <- moves[
+  ,
+  .(n_moves = .N),
+  by = to_cluster
+][
+  order(-n_moves)
+]
+
+# Top 100 destination clusters
+top50 <- cluster_pop[1:50, to_cluster]
+
+# Merge popularity back and keep only top 50 moves
+moves_model <- merge(
+  moves,
+  cluster_pop[, .(to_cluster, cluster_popularity = n_moves)],
+  by = "to_cluster",
+  all.x = TRUE
+)
+
+moves_model <- moves_model[to_cluster %in% top50]
+
+# Simple weight column: 1 move per row
+moves_model[, n_moves := 1L]
+
+# Factors for RF
+moves_model[
+  ,
+  `:=`(
+    to_cluster   = factor(to_cluster),
+    from_cluster = factor(from_cluster)
+  )
+]
+
+# Count how often each origin cluster appears
+from_freq <- moves_model[
+  ,
+  .N,
+  by = from_cluster
+][order(-N)]
+
+# Top 100 most common origin clusters
+top_from <- from_freq[1:50, from_cluster]
+
+# Collapse origins into top 10 vs "Other"
+moves_model[
+  ,
+  from_cluster_small := ifelse(from_cluster %in% top_from,
+                               as.character(from_cluster),
+                               "Other")
+]
+
+moves_model[, from_cluster_small := factor(from_cluster_small)]
+#--------------------------------------------------
+# Memory crash: downsample 
+#   (keep at most 400,000 rows)
+#--------------------------------------------------
+set.seed(123)
+maxN <- 400000L
+
+if (nrow(moves_model) > maxN) {
+  moves_model <- moves_model[sample(.N, maxN)]
+}
+
+
+```
+
+## Train/Test
+```{r train mod 2}
+set.seed(123)
+
+n <- nrow(moves_model)
+train_idx <- sample.int(n, size = floor(0.7 * n))
+
+train_dt <- moves_model[train_idx]
+test_dt  <- moves_model[-train_idx]
+
+```
+
+## RF with top 50 clusters and time predictors
+```{r RF mod 2}
+library(dplyr)
+library(gt)
+library(tidyr)
+
+rf_formula_top50 <- to_cluster ~
+  from_cluster_small +
+  cluster_popularity +
+  hour_of_day +
+  wday +
+  is_weekend +
+  part_of_day
+
+set.seed(123)
+rf_mod_top50 <- randomForest(
+  rf_formula_top50,
+  data       = train_dt,
+  ntree      = 300,
+  mtry       = 3,
+  importance = TRUE
+)
+
+
+
+
+rf_mod_top50
+
+varImpPlot(rf_mod_top50)
+
+```
+
